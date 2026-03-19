@@ -130,36 +130,80 @@ pub const Ring = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests – Linux syscall helpers (posix wrappers removed in Zig 0.16)
 // ---------------------------------------------------------------------------
 
-fn createListenSocket() !posix.socket_t {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
+fn testSocket() !posix.fd_t {
+    const rc = linux.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    return if (posix.errno(rc) != .SUCCESS) error.SocketFailed else @intCast(rc);
+}
+
+fn testClose(fd: posix.fd_t) void {
+    _ = linux.close(fd);
+}
+
+fn testSetsockopt(fd: posix.fd_t, optname: u32, optval: *const [4]u8) !void {
+    const rc = linux.setsockopt(fd, posix.SOL.SOCKET, optname, @ptrCast(optval), 4);
+    if (posix.errno(rc) != .SUCCESS) return error.SetsockoptFailed;
+}
+
+fn testBind(fd: posix.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+    const rc = linux.bind(fd, addr, addrlen);
+    if (posix.errno(rc) != .SUCCESS) return error.BindFailed;
+}
+
+fn testListen(fd: posix.fd_t, backlog: u31) !void {
+    const rc = linux.listen(fd, backlog);
+    if (posix.errno(rc) != .SUCCESS) return error.ListenFailed;
+}
+
+fn testConnect(fd: posix.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t) !void {
+    const rc = linux.connect(fd, addr, addrlen);
+    if (posix.errno(rc) != .SUCCESS) return error.ConnectFailed;
+}
+
+fn testGetsockname(fd: posix.fd_t, addr: *posix.sockaddr, addrlen: *posix.socklen_t) !void {
+    const rc = linux.getsockname(fd, addr, addrlen);
+    if (posix.errno(rc) != .SUCCESS) return error.GetsocknameFailed;
+}
+
+fn testWrite(fd: posix.fd_t, buf: []const u8) !usize {
+    const rc = linux.write(fd, buf.ptr, buf.len);
+    return if (posix.errno(rc) != .SUCCESS) error.WriteFailed else rc;
+}
+
+fn testRead(fd: posix.fd_t, buf: []u8) !usize {
+    const rc = linux.read(fd, buf.ptr, buf.len);
+    return if (posix.errno(rc) != .SUCCESS) error.ReadFailed else rc;
+}
+
+fn createListenSocket() !posix.fd_t {
+    const fd = try testSocket();
+    errdefer testClose(fd);
 
     // Allow port reuse
     const one: [4]u8 = @bitCast(@as(i32, 1));
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &one);
+    try testSetsockopt(fd, posix.SO.REUSEADDR, &one);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0); // port 0 = ephemeral
-    try posix.bind(fd, &addr.any, addr.getOsSockLen());
-    try posix.listen(fd, 1);
+    try testBind(fd, &addr.any, addr.getOsSockLen());
+    try testListen(fd, 1);
     return fd;
 }
 
-fn getBoundPort(fd: posix.socket_t) !u16 {
+fn getBoundPort(fd: posix.fd_t) !u16 {
     var addr: posix.sockaddr.in = undefined;
     var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    try posix.getsockname(fd, @ptrCast(&addr), &addrlen);
+    try testGetsockname(fd, @ptrCast(&addr), &addrlen);
     return std.mem.bigToNative(u16, addr.port);
 }
 
-fn createClientSocket(port: u16) !posix.socket_t {
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
+fn createClientSocket(port: u16) !posix.fd_t {
+    const fd = try testSocket();
+    errdefer testClose(fd);
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
+    try testConnect(fd, &addr.any, addr.getOsSockLen());
     return fd;
 }
 
@@ -174,24 +218,24 @@ test "Ring full accept-recv-send-close cycle" {
 
     // Create a TCP listen socket on an ephemeral port
     const listen_fd = try createListenSocket();
-    defer posix.close(listen_fd);
+    defer testClose(listen_fd);
 
     const port = try getBoundPort(listen_fd);
 
     // Create a client socket and connect
     const client_fd = try createClientSocket(port);
-    defer posix.close(client_fd);
+    defer testClose(client_fd);
 
     // 1) accept via io_uring
     _ = try ring.prepAccept(listen_fd, 1);
     var cqe = try ring.waitCqe();
     try std.testing.expect(cqe.res >= 0);
     const accepted_fd: posix.fd_t = @intCast(cqe.res);
-    // NOTE: We do NOT defer posix.close(accepted_fd) here because step 6 closes it via io_uring.
+    // NOTE: We do NOT defer testClose(accepted_fd) here because step 6 closes it via io_uring.
 
     // 2) Client sends data (regular posix write)
     const msg = "hello io_uring";
-    _ = try posix.write(client_fd, msg);
+    _ = try testWrite(client_fd, msg);
 
     // 3) recv via io_uring on the accepted fd
     var recv_buf: [64]u8 = undefined;
@@ -208,7 +252,7 @@ test "Ring full accept-recv-send-close cycle" {
 
     // 5) Client reads the echoed data (regular posix read)
     var echo_buf: [64]u8 = undefined;
-    const echo_len = try posix.read(client_fd, &echo_buf);
+    const echo_len = try testRead(client_fd, &echo_buf);
     try std.testing.expectEqualStrings(msg, echo_buf[0..echo_len]);
 
     // 6) close the accepted fd via io_uring
@@ -223,10 +267,10 @@ test "Ring multishot accept accepts multiple connections from one SQE" {
 
     // Create a listen socket with a large enough backlog for our test
     const listen_fd = try createListenSocket();
-    defer posix.close(listen_fd);
+    defer testClose(listen_fd);
 
     // Re-set backlog to 16 (createListenSocket uses 1)
-    try posix.listen(listen_fd, 16);
+    try testListen(listen_fd, 16);
 
     const port = try getBoundPort(listen_fd);
 
@@ -244,7 +288,7 @@ test "Ring multishot accept accepts multiple connections from one SQE" {
     for (0..num_clients) |i| {
         client_fds[i] = try createClientSocket(port);
     }
-    defer for (client_fds) |cfd| posix.close(cfd);
+    defer for (client_fds) |cfd| testClose(cfd);
 
     // Now harvest all accept CQEs from the single multishot SQE
     for (0..num_clients) |i| {
@@ -254,7 +298,7 @@ test "Ring multishot accept accepts multiple connections from one SQE" {
         if (cqe.res < 0) {
             const errno = cqe.err();
             if (errno == .INVAL) {
-                for (accepted_fds[0..accepts_received]) |afd| posix.close(afd);
+                for (accepted_fds[0..accepts_received]) |afd| testClose(afd);
                 return error.SkipZigTest;
             }
         }
@@ -270,7 +314,7 @@ test "Ring multishot accept accepts multiple connections from one SQE" {
 
     try std.testing.expectEqual(@as(usize, num_clients), accepts_received);
 
-    for (accepted_fds[0..accepts_received]) |afd| posix.close(afd);
+    for (accepted_fds[0..accepts_received]) |afd| testClose(afd);
 }
 
 test "Ring buffer group lifecycle with buffer recycling" {
@@ -291,17 +335,17 @@ test "Ring buffer group lifecycle with buffer recycling" {
 
     // Create a connected socket pair via listen + connect + accept
     const listen_fd = try createListenSocket();
-    defer posix.close(listen_fd);
+    defer testClose(listen_fd);
     const port = try getBoundPort(listen_fd);
 
     const client_fd = try createClientSocket(port);
-    defer posix.close(client_fd);
+    defer testClose(client_fd);
 
     _ = try ring.prepAccept(listen_fd, 0);
     var cqe = try ring.waitCqe();
     try std.testing.expect(cqe.res >= 0);
     const server_fd: posix.fd_t = @intCast(cqe.res);
-    defer posix.close(server_fd);
+    defer testClose(server_fd);
 
     // Perform more rounds than the buffer count to prove recycling works
     const rounds = 6;
@@ -310,7 +354,7 @@ test "Ring buffer group lifecycle with buffer recycling" {
         const msg = "hello buffer ring!";
 
         // Client sends data
-        _ = try posix.write(client_fd, msg);
+        _ = try testWrite(client_fd, msg);
 
         // Server recvs using buffer group (kernel picks a buffer)
         _ = try buf_grp.recv(100, server_fd, 0);
@@ -341,8 +385,8 @@ test "Ring recv on closed fd returns negative result" {
     defer ring.deinit();
 
     // Create a socket and immediately close it
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    posix.close(fd);
+    const fd = try testSocket();
+    testClose(fd);
 
     // Try to recv on the closed fd via io_uring
     var buf: [64]u8 = undefined;
