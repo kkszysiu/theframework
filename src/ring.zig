@@ -177,6 +177,16 @@ fn testRead(fd: posix.fd_t, buf: []u8) !usize {
     return if (posix.errno(rc) != .SUCCESS) error.ReadFailed else rc;
 }
 
+fn makeSockaddrIn4(addr_bytes: [4]u8, port: u16) posix.sockaddr {
+    const addr: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(addr_bytes),
+        .zero = [_]u8{0} ** 8,
+    };
+    return @bitCast(addr);
+}
+
 fn createListenSocket() !posix.fd_t {
     const fd = try testSocket();
     errdefer testClose(fd);
@@ -185,8 +195,8 @@ fn createListenSocket() !posix.fd_t {
     const one: [4]u8 = @bitCast(@as(i32, 1));
     try testSetsockopt(fd, posix.SO.REUSEADDR, &one);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0); // port 0 = ephemeral
-    try testBind(fd, &addr.any, addr.getOsSockLen());
+    var addr = makeSockaddrIn4(.{ 127, 0, 0, 1 }, 0); // port 0 = ephemeral
+    try testBind(fd, &addr, @sizeOf(posix.sockaddr.in));
     try testListen(fd, 1);
     return fd;
 }
@@ -202,8 +212,8 @@ fn createClientSocket(port: u16) !posix.fd_t {
     const fd = try testSocket();
     errdefer testClose(fd);
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    try testConnect(fd, &addr.any, addr.getOsSockLen());
+    var addr = makeSockaddrIn4(.{ 127, 0, 0, 1 }, port);
+    try testConnect(fd, &addr, @sizeOf(posix.sockaddr.in));
     return fd;
 }
 
