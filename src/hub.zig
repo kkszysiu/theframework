@@ -47,6 +47,14 @@ fn linuxSocket(domain: u32, socket_type: u32, protocol: u32) !posix.fd_t {
         @intCast(rc);
 }
 
+fn linuxPipe() ![2]posix.fd_t {
+    var fds: [2]i32 = undefined;
+    return if (posix.errno(linux.pipe(&fds)) != .SUCCESS)
+        error.PipeFailed
+    else
+        fds;
+}
+
 /// Build a sockaddr_in from IPv4 bytes + port (replaces std.net.Address.initIp4).
 fn makeSockaddrIn4(addr_bytes: [4]u8, port: u16) posix.sockaddr {
     const addr: posix.sockaddr.in = .{
@@ -121,7 +129,7 @@ pub const Hub = struct {
         var op_slots = try OpSlotTable.init(allocator);
         errdefer op_slots.deinit();
 
-        const pipe_fds = try posix.pipe();
+        const pipe_fds = try linuxPipe();
 
         return Hub{
             .ring = ring,
