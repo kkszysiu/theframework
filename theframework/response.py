@@ -26,10 +26,11 @@ _REASON_PHRASES: dict[int, str] = {
 class Response:
     """HTTP response object that buffers data and sends on finalize."""
 
-    __slots__ = ("status", "_headers", "_body_parts", "_fd", "_finalized")
+    __slots__ = ("status", "_headers", "_multi_headers", "_body_parts", "_fd", "_finalized")
 
     status: int
     _headers: dict[str, str]
+    _multi_headers: list[tuple[str, str]]
     _body_parts: list[bytes]
     _fd: int
     _finalized: bool
@@ -37,6 +38,7 @@ class Response:
     def __init__(self, fd: int) -> None:
         self.status = 200
         self._headers = {}
+        self._multi_headers = []
         self._body_parts = []
         self._fd = fd
         self._finalized = False
@@ -45,7 +47,12 @@ class Response:
         self.status = code
 
     def set_header(self, name: str, value: str) -> None:
+        """Set a header (replaces existing). For single-value headers."""
         self._headers[name] = value
+
+    def add_header(self, name: str, value: str) -> None:
+        """Add a header (appends). For multi-value headers like Set-Cookie."""
+        self._multi_headers.append((name, value))
 
     def write(self, data: bytes | str) -> None:
         if isinstance(data, str):
@@ -66,6 +73,9 @@ class Response:
         for name, value in self._headers.items():
             if name == "Content-Length":
                 continue
+            header_pairs.append((name.encode("latin-1"), value.encode("latin-1")))
+        # Append multi-value headers (Set-Cookie, etc.)
+        for name, value in self._multi_headers:
             header_pairs.append((name.encode("latin-1"), value.encode("latin-1")))
 
         # Single Zig call: formats headers in arena + writev (zero-copy body)

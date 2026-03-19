@@ -77,8 +77,14 @@ pub const Ring = struct {
     }
 
     /// Queue a connect operation on a socket fd.
+    /// NOTE: We bypass IoUring.connect() because in Zig 0.15.2 it accepts
+    /// posix.sockaddr but prep_connect expects linux.sockaddr — these diverge
+    /// when libc is linked.
     pub fn prepConnect(self: *Ring, fd: posix.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t, user_data: u64) !*linux.io_uring_sqe {
-        return try self.io.connect(user_data, fd, addr, addrlen);
+        const sqe = try self.io.get_sqe();
+        sqe.prep_connect(fd, @ptrCast(addr), addrlen);
+        sqe.user_data = user_data;
+        return sqe;
     }
 
     /// Queue a poll operation on a file descriptor.
