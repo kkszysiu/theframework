@@ -125,7 +125,7 @@ pub const ConnectionPool = struct {
         }
 
         // Pre-populate free list (all slots are free)
-        var free_list = std.ArrayListUnmanaged(u16){};
+        var free_list: std.ArrayListUnmanaged(u16) = .empty;
         try free_list.ensureTotalCapacity(allocator, max_conns);
         var i: u16 = @intCast(max_conns);
         while (i > 0) {

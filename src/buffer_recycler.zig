@@ -31,7 +31,7 @@ pub const BufferRecycler = struct {
     pub fn init(allocator: std.mem.Allocator) BufferRecycler {
         var bins: [NUM_BINS]std.ArrayListUnmanaged([*]u8) = undefined;
         for (&bins) |*bin| {
-            bin.* = .{};
+            bin.* = .empty;
         }
         return .{
             .bins = bins,

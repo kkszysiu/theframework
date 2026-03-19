@@ -22,6 +22,42 @@ const BufferRecycler = @import("buffer_recycler.zig").BufferRecycler;
 
 const lazy_request = @import("lazy_request.zig");
 
+// ---------------------------------------------------------------------------
+// Zig 0.16 compat: posix.close/write/socket were removed from std.posix.
+// Use raw linux syscalls instead (this is a Linux-only io_uring framework).
+// ---------------------------------------------------------------------------
+
+fn linuxClose(fd: posix.fd_t) void {
+    _ = linux.close(fd);
+}
+
+fn linuxWrite(fd: posix.fd_t, buf: []const u8) !usize {
+    const rc = linux.write(fd, buf.ptr, buf.len);
+    return if (posix.errno(rc) != .SUCCESS)
+        error.WriteFailed
+    else
+        rc;
+}
+
+fn linuxSocket(domain: u32, socket_type: u32, protocol: u32) !posix.fd_t {
+    const rc = linux.socket(domain, socket_type, protocol);
+    return if (posix.errno(rc) != .SUCCESS)
+        error.SocketFailed
+    else
+        @intCast(rc);
+}
+
+/// Build a sockaddr_in from IPv4 bytes + port (replaces std.net.Address.initIp4).
+fn makeSockaddrIn4(addr_bytes: [4]u8, port: u16) posix.sockaddr {
+    var addr: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(addr_bytes),
+        .zero = [_]u8{0} ** 8,
+    };
+    return @bitCast(addr);
+}
+
 const py = @cImport({
     @cInclude("py_helpers.h");
 });
@@ -144,8 +180,8 @@ pub const Hub = struct {
         self.ready.deinit(self.allocator);
 
         // Close stop pipe
-        posix.close(self.stop_pipe[0]);
-        posix.close(self.stop_pipe[1]);
+        linuxClose(self.stop_pipe[0]);
+        linuxClose(self.stop_pipe[1]);
 
         // Decref hub greenlet
         if (self.hub_greenlet) |g| {
@@ -360,8 +396,8 @@ pub const Hub = struct {
         const status = statusFromInt(status_code) orelse return;
         var buf: [256]u8 = undefined;
         const n = http_response.writeResponse(&buf, status, &.{}, "") catch return;
-        _ = posix.write(fd, buf[0..n]) catch {};
-        posix.close(fd);
+        _ = linuxWrite(fd, buf[0..n]) catch {};
+        linuxClose(fd);
     }
 
     // -----------------------------------------------------------------------
@@ -995,7 +1031,7 @@ pub const Hub = struct {
 
     pub fn greenConnect(self: *Hub, host: [*:0]const u8, port: u16) ?*PyObject {
         // Create TCP socket
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
+        const fd = linuxSocket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
             py.py_helper_err_set_string(
                 py.py_helper_exc_oserror(),
                 "green_connect: failed to create socket",
@@ -1005,7 +1041,7 @@ pub const Hub = struct {
 
         // Parse host address
         const addr_bytes = parseIpv4(host) orelse {
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_string(
                 py.py_helper_exc_oserror(),
                 "green_connect: invalid IPv4 address",
@@ -1016,7 +1052,7 @@ pub const Hub = struct {
         // Register fd in connection pool first
         const fd_usize: usize = @intCast(fd);
         if (fd_usize >= MAX_FDS) {
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
                 "green_connect: fd too large",
@@ -1025,7 +1061,7 @@ pub const Hub = struct {
         }
 
         const conn = self.pool.acquire() orelse {
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
                 "green_connect: connection pool exhausted",
@@ -1040,7 +1076,7 @@ pub const Hub = struct {
         const slot = self.op_slots.acquire() orelse {
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_string(
                 py.py_helper_exc_runtime_error(),
                 "green_connect: op slot table exhausted",
@@ -1053,12 +1089,12 @@ pub const Hub = struct {
             self.op_slots.release(slot);
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             return null;
         };
 
         // Store sockaddr in the slot — survives greenlet stack swaps.
-        slot.storage = .{ .sockaddr = std.net.Address.initIp4(addr_bytes, port).any };
+        slot.storage = .{ .sockaddr = makeSockaddrIn4(addr_bytes, port) };
 
         // Submit connect SQE using op_slot user_data
         const user_data = op_slot.encodeUserData(slot.slot_index, slot.generation);
@@ -1067,7 +1103,7 @@ pub const Hub = struct {
             self.op_slots.release(slot);
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_string(
                 py.py_helper_exc_oserror(),
                 "green_connect: failed to submit connect SQE",
@@ -1090,7 +1126,7 @@ pub const Hub = struct {
             self.op_slots.release(slot);
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             return null;
         };
         const switch_result = py.py_helper_greenlet_switch(hub_g, null, null);
@@ -1098,7 +1134,7 @@ pub const Hub = struct {
             self.cleanupSlotSwitch(slot);
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             return null;
         }
         py.py_helper_decref(switch_result);
@@ -1110,7 +1146,7 @@ pub const Hub = struct {
         if (res < 0) {
             self.fd_to_conn[fd_usize] = null;
             self.pool.release(conn);
-            posix.close(fd);
+            linuxClose(fd);
             py.py_helper_err_set_from_errno(-res);
             return null;
         }
@@ -1157,7 +1193,7 @@ pub const Hub = struct {
         };
 
         // Store sockaddr in the slot — survives greenlet stack swaps.
-        slot.storage = .{ .sockaddr = std.net.Address.initIp4(addr_bytes, port).any };
+        slot.storage = .{ .sockaddr = makeSockaddrIn4(addr_bytes, port) };
 
         // Submit connect SQE using op_slot user_data
         const user_data = op_slot.encodeUserData(slot.slot_index, slot.generation);
@@ -1854,7 +1890,7 @@ pub fn pyHubStop(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
         return null;
     };
 
-    _ = posix.write(hub_ptr.stop_pipe[1], &[_]u8{1}) catch {
+    _ = linuxWrite(hub_ptr.stop_pipe[1], &[_]u8{1}) catch {
         py.py_helper_err_set_string(
             py.py_helper_exc_oserror(),
             "hub_stop: failed to write to stop pipe",
@@ -1932,7 +1968,7 @@ pub fn pyGreenClose(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 
     const hub_ptr = getHub() orelse {
         // No hub running — just close the fd directly
-        posix.close(@intCast(fd_long));
+        linuxClose(@intCast(fd_long));
         const none = py.py_helper_none();
         py.py_helper_incref(none);
         return none;

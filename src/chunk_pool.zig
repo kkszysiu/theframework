@@ -22,7 +22,7 @@ pub const ChunkRecycler = struct {
     total_allocated: usize, // chunks ever malloc'd (for monitoring)
 
     pub fn init(allocator: std.mem.Allocator) ChunkRecycler {
-        return .{ .free_stack = .{}, .allocator = allocator, .total_allocated = 0 };
+        return .{ .free_stack = .empty, .allocator = allocator, .total_allocated = 0 };
     }
 
     pub fn deinit(self: *ChunkRecycler) void {
