@@ -49,7 +49,7 @@ fn linuxSocket(domain: u32, socket_type: u32, protocol: u32) !posix.fd_t {
 
 /// Build a sockaddr_in from IPv4 bytes + port (replaces std.net.Address.initIp4).
 fn makeSockaddrIn4(addr_bytes: [4]u8, port: u16) posix.sockaddr {
-    var addr: posix.sockaddr.in = .{
+    const addr: posix.sockaddr.in = .{
         .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
         .addr = @bitCast(addr_bytes),
