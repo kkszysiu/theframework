@@ -87,7 +87,7 @@ pub const OpSlotTable = struct {
     pub fn init(allocator: std.mem.Allocator) !OpSlotTable {
         var table = OpSlotTable{
             .slots = undefined,
-            .free_list = .{},
+            .free_list = .empty,
             .allocator = allocator,
         };
 
