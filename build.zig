@@ -1,14 +1,19 @@
 const std = @import("std");
 
+fn detectPython(b: *std.Build, script: []const u8) []const u8 {
+    const stdout = b.run(&.{ "python3", "-c", script });
+    return std.mem.trim(u8, stdout, &std.ascii.whitespace);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // User-configurable paths (with sensible defaults)
-    const python_include = b.option([]const u8, "python-include", "Python include directory (e.g. /usr/include/python3.14)") orelse "/home/canassa/.local/share/uv/python/cpython-3.14.3-linux-x86_64-gnu/include/python3.14";
-    const greenlet_include = b.option([]const u8, "greenlet-include", "Greenlet include directory (contains greenlet.h)") orelse ".venv/lib/python3.14/site-packages/greenlet";
-    const python_lib = b.option([]const u8, "python-lib", "Python library directory (e.g. /usr/lib)") orelse "/home/canassa/.local/share/uv/python/cpython-3.14.3-linux-x86_64-gnu/lib";
-    const ext_suffix = b.option([]const u8, "ext-suffix", "Python extension suffix (e.g. .cpython-314-x86_64-linux-gnu.so)") orelse ".cpython-314-x86_64-linux-gnu";
+    // Auto-detect Python paths, with user overrides
+    const python_include = b.option([]const u8, "python-include", "Python include directory (e.g. /usr/include/python3.14)") orelse detectPython(b, "import sysconfig; print(sysconfig.get_path('include'))");
+    const greenlet_include = b.option([]const u8, "greenlet-include", "Greenlet include directory (contains greenlet.h)") orelse detectPython(b, "import greenlet; import os; print(os.path.dirname(greenlet.__file__))");
+    const python_lib = b.option([]const u8, "python-lib", "Python library directory (e.g. /usr/lib)") orelse detectPython(b, "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))");
+    const ext_suffix = b.option([]const u8, "ext-suffix", "Python extension suffix (e.g. .cpython-314-x86_64-linux-gnu.so)") orelse detectPython(b, "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX').removesuffix('.so'))");
 
     // -----------------------------------------------------------------------
     // Shared library: libframework.so
@@ -41,18 +46,16 @@ pub fn build(b: *std.Build) void {
     ext_module.addIncludePath(.{ .cwd_relative = python_include });
     ext_module.addIncludePath(.{ .cwd_relative = greenlet_include });
 
+    ext_module.addCSourceFile(.{
+        .file = b.path("src/py_helpers.c"),
+        .flags = &.{},
+    });
+
     const ext = b.addLibrary(.{
         .linkage = .dynamic,
         .name = ext_name,
         .root_module = ext_module,
     });
-    ext.addCSourceFile(.{
-        .file = b.path("src/py_helpers.c"),
-        .flags = &.{},
-    });
-    ext.root_module.addIncludePath(b.path("src"));
-    ext.root_module.addIncludePath(.{ .cwd_relative = python_include });
-    ext.root_module.addIncludePath(.{ .cwd_relative = greenlet_include });
 
     // Install with the correct name (no "lib" prefix) so Python can import it
     const ext_install = b.addInstallFile(ext.getEmittedBin(), b.fmt("lib/{s}.so", .{ext_name}));
@@ -205,14 +208,11 @@ pub fn build(b: *std.Build) void {
     hub_test_mod.addIncludePath(.{ .cwd_relative = greenlet_include });
     hub_test_mod.addLibraryPath(.{ .cwd_relative = python_lib });
     hub_test_mod.linkSystemLibrary("python3.14", .{});
-    const hub_tests = b.addTest(.{ .root_module = hub_test_mod });
-    hub_tests.addCSourceFile(.{
+    hub_test_mod.addCSourceFile(.{
         .file = b.path("src/py_helpers.c"),
         .flags = &.{},
     });
-    hub_tests.root_module.addIncludePath(b.path("src"));
-    hub_tests.root_module.addIncludePath(.{ .cwd_relative = python_include });
-    hub_tests.root_module.addIncludePath(.{ .cwd_relative = greenlet_include });
+    const hub_tests = b.addTest(.{ .root_module = hub_test_mod });
     const run_hub_tests = b.addRunArtifact(hub_tests);
 
     const test_step = b.step("test", "Run tests");
