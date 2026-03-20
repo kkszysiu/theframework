@@ -1,14 +1,20 @@
 import ctypes
 import pathlib
+import platform
 import sys
 
-_PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
-_LIB_PATH = _PROJECT_ROOT / "zig-out" / "lib" / "libframework.so"
+_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
+_LIB_NAME = "libframework.dylib" if platform.system() == "Darwin" else "libframework.so"
+_LIB_PATH = _PACKAGE_DIR / _LIB_NAME
 
-# Add zig-out/lib to sys.path so `import _framework_core` works everywhere
-_ext_dir = str(_PROJECT_ROOT / "zig-out" / "lib")
-if _ext_dir not in sys.path:
-    sys.path.insert(0, _ext_dir)
+if not _LIB_PATH.exists():
+    # Fallback for development: load from zig-out/lib/
+    _PROJECT_ROOT = _PACKAGE_DIR.parent
+    _LIB_PATH = _PROJECT_ROOT / "zig-out" / "lib" / _LIB_NAME
+    # Also add zig-out/lib to sys.path so `import _framework_core` works
+    _ext_dir = str(_PROJECT_ROOT / "zig-out" / "lib")
+    if _ext_dir not in sys.path:
+        sys.path.insert(0, _ext_dir)
 
 _lib = ctypes.CDLL(str(_LIB_PATH))
 _lib.framework_version.restype = ctypes.c_int32

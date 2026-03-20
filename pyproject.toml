@@ -10,6 +10,16 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+artifacts = [
+    "theframework/*.so",
+    "theframework/*.dylib",
+    "_framework_core*.so",
+]
+
 [tool.mypy]
 strict = true
 warn_return_any = true
