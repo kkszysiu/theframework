@@ -15,9 +15,12 @@ The hook copies them so they end up in the installed package:
 from __future__ import annotations
 
 import glob
+import os
 import platform
 import shutil
 import subprocess
+import sys
+import sysconfig
 from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
@@ -42,6 +45,32 @@ class ZigBuildHook(BuildHookInterface):
         """Glob pattern that matches the Python C extension."""
         return "_framework_core*.so"
 
+    @staticmethod
+    def _detect_zig_options() -> list[str]:
+        """Detect Python/greenlet paths from the current interpreter and
+        return them as ``-D`` flags for ``zig build``."""
+        import greenlet
+
+        flags = []
+
+        python_include = sysconfig.get_path("include")
+        if python_include:
+            flags.append(f"-Dpython-include={python_include}")
+
+        greenlet_dir = os.path.dirname(greenlet.__file__)
+        flags.append(f"-Dgreenlet-include={greenlet_dir}")
+
+        python_lib = sysconfig.get_config_var("LIBDIR")
+        if python_lib:
+            flags.append(f"-Dpython-lib={python_lib}")
+
+        ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+        if ext_suffix:
+            # build.zig expects the suffix *without* the trailing .so
+            flags.append(f"-Dext-suffix={ext_suffix.removesuffix('.so')}")
+
+        return flags
+
     # ------------------------------------------------------------------
     # hook entry point
     # ------------------------------------------------------------------
@@ -50,8 +79,9 @@ class ZigBuildHook(BuildHookInterface):
         root = Path(self.root)
         zig_lib = root / "zig-out" / "lib"
 
-        # 1. Run ``zig build`` -------------------------------------------
-        subprocess.check_call(["zig", "build"], cwd=str(root))
+        # 1. Run ``zig build`` with explicit Python paths ----------------
+        cmd = ["zig", "build", *self._detect_zig_options()]
+        subprocess.check_call(cmd, cwd=str(root))
 
         # 2. Locate artifacts --------------------------------------------
         lib_src = zig_lib / self._lib_name()
