@@ -146,12 +146,19 @@ def _patch_socket_checker(module: object) -> None:
     orig_poll_cls = _get_original("select", "poll")
     if orig_poll_cls is None:
         return
+    try:
+        orig_poller_type = type(orig_poll_cls())  # type: ignore[operator]
+    except TypeError:
+        orig_poller_type = None
 
     def _ensure_original_poller(self: object) -> None:
         if not getattr(module, "_HAVE_POLL", False):
             return
         poller = getattr(self, "_poller", None)
-        if poller is None or not isinstance(poller, orig_poll_cls):  # type: ignore[arg-type]
+        if poller is None:
+            self._poller = orig_poll_cls()  # type: ignore[operator]
+            return
+        if orig_poller_type is not None and not isinstance(poller, orig_poller_type):
             self._poller = orig_poll_cls()  # type: ignore[operator]
 
     orig_init = socket_checker_cls.__init__
