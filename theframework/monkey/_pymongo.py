@@ -1,42 +1,27 @@
 """Monkey-patch ``pymongo`` for cooperative MongoDB I/O.
 
-pymongo's internal network I/O interacts with our cooperative socket layer
-in ways that can cause deep C-stack recursion and segfaults on CPython 3.14
-with greenlets.
+PyMongo's synchronous networking code uses background monitor threads, its own
+socket polling helpers, and several imported function aliases. Those paths can
+interact badly with our cooperative stdlib monkey patches when they execute in
+arbitrary threads.
 
-Strategy: replace pymongo's key I/O entry points with versions that run
-the blocking call in a background thread and cooperatively wait for the
-result via a pipe — the same pattern used for DNS resolution in
-``_dns.py``.  pymongo sockets are created and used entirely in worker
-threads (where ``hub_is_running()`` is False), so they stay in plain
-blocking mode and never touch io_uring.  The calling greenlet yields to
-the hub and resumes when the thread finishes.
+Strategy: funnel MongoDB socket creation and blocking network I/O through a
+dedicated worker pool. The hub thread waits cooperatively for completion; plain
+background threads simply block on the worker future. Either way, the actual
+Mongo I/O runs in ``mongo-io_*`` threads where ``hub_is_running()`` is false,
+so sockets stay in plain blocking mode and never touch io_uring.
 
-The effective patching points:
-
-1. ``pymongo.pool._configured_socket`` — socket creation + connect + SSL.
-   Running this in a thread ensures the socket is never registered with
-   the hub and stays blocking.
-
-2. ``pymongo.network.command`` AND ``pymongo.pool.command`` — sends a
-   command and reads the response. ``pymongo.pool`` imports
-   ``pymongo.network.command`` into its own module globals, so patching
-   ``pymongo.network.command`` alone is not enough after pymongo has
-   already been imported.
-
-3. ``pymongo.network.receive_message`` — reads a response (used for
-   cursor iteration via ``getMore``).
-
-Inside the worker thread, ``hub_is_running()`` returns ``False``, so all
-our monkey-patched socket/select/ssl functions fall through to their
-original blocking implementations.  No nested thread spawning occurs
-because ``_run_in_thread`` checks ``hub_is_running()`` first.
+The patch supports both the older module layout (``pymongo.pool`` /
+``pymongo.network``) and the current one (``pymongo.synchronous.pool`` /
+``pymongo.synchronous.network`` / ``pymongo.network_layer``).
 """
 
 from __future__ import annotations
 
 import os as _os
+import threading as _threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from importlib import import_module as _import_module
 
 import _framework_core
 
@@ -53,6 +38,7 @@ _POLLIN: int = 0x001
 # ---------------------------------------------------------------------------
 
 _mongo_pool: ThreadPoolExecutor | None = None
+_worker_local = _threading.local()
 
 
 def _get_pool() -> ThreadPoolExecutor:
@@ -60,6 +46,10 @@ def _get_pool() -> ThreadPoolExecutor:
     if _mongo_pool is None:
         _mongo_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mongo-io")
     return _mongo_pool
+
+
+def _in_mongo_worker() -> bool:
+    return bool(getattr(_worker_local, "active", False))
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +60,25 @@ def _get_pool() -> ThreadPoolExecutor:
 def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
     """Run *fn(*args, **kwargs)* in the mongo I/O thread pool.
 
-    If the hub is not running (e.g. we are already in a worker thread),
-    call *fn* directly — this prevents nested thread spawning when a
-    wrapped function calls another wrapped function.
+    Hub threads wait cooperatively for the worker. Non-hub threads block on the
+    Future result. Calls originating from inside a mongo worker run inline to
+    avoid nested thread spawning.
     """
-    if not _hub_is_running():
+    if _in_mongo_worker():
         return fn(*args, **kwargs)  # type: ignore[operator]
 
     pool = _get_pool()
+
+    def _call() -> object:
+        _worker_local.active = True
+        try:
+            return fn(*args, **kwargs)  # type: ignore[operator]
+        finally:
+            _worker_local.active = False
+
+    if not _hub_is_running():
+        future: Future[object] = pool.submit(_call)
+        return future.result()
 
     r_fd, w_fd = _os.pipe()
     _os.set_blocking(r_fd, False)
@@ -87,7 +88,7 @@ def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
 
     def _worker() -> None:
         try:
-            result_box[0] = fn(*args, **kwargs)  # type: ignore[operator]
+            result_box[0] = _call()
         except BaseException as exc:
             error_box[0] = exc
         finally:
@@ -113,6 +114,62 @@ def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
     return result_box[0]
 
 
+def _maybe_import(name: str) -> object | None:
+    try:
+        return _import_module(name)
+    except ImportError:
+        return None
+
+
+def _wrap_via_thread(wrapped: dict[int, object], fn: object) -> object:
+    key = id(fn)
+    if key not in wrapped:
+        def _wrapper(*args: object, **kwargs: object) -> object:
+            return _run_in_thread(fn, *args, **kwargs)
+
+        wrapped[key] = _wrapper
+    return wrapped[key]
+
+
+def _patch_attr(module: object, attr: str, wrapped: dict[int, object]) -> None:
+    if not hasattr(module, attr):
+        return
+    original = getattr(module, attr)
+    setattr(module, attr, _wrap_via_thread(wrapped, original))
+
+
+def _patch_socket_checker(module: object) -> None:
+    if not hasattr(module, "SocketChecker"):
+        return
+
+    socket_checker_cls = module.SocketChecker
+    orig_poll_cls = _get_original("select", "poll")
+    if orig_poll_cls is None:
+        return
+
+    def _ensure_original_poller(self: object) -> None:
+        if not getattr(module, "_HAVE_POLL", False):
+            return
+        poller = getattr(self, "_poller", None)
+        if poller is None or not isinstance(poller, orig_poll_cls):  # type: ignore[arg-type]
+            self._poller = orig_poll_cls()  # type: ignore[operator]
+
+    orig_init = socket_checker_cls.__init__
+
+    def _patched_init(self: object, *args: object, **kwargs: object) -> None:
+        orig_init(self, *args, **kwargs)
+        _ensure_original_poller(self)
+
+    orig_select = socket_checker_cls.select
+
+    def _patched_select(self: object, *args: object, **kwargs: object) -> object:
+        _ensure_original_poller(self)
+        return orig_select(self, *args, **kwargs)
+
+    socket_checker_cls.__init__ = _patched_init
+    socket_checker_cls.select = _patched_select
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -130,55 +187,42 @@ def patch_pymongo() -> None:
     if _patched:
         return
 
-    try:
-        import pymongo.network as _network
-        import pymongo.pool as _pool
-    except ImportError:
-        return  # pymongo not installed, nothing to patch
+    pool_modules = [
+        module
+        for module in (
+            _maybe_import("pymongo.pool"),
+            _maybe_import("pymongo.synchronous.pool"),
+        )
+        if module is not None
+    ]
+    network_modules = [
+        module
+        for module in (
+            _maybe_import("pymongo.network"),
+            _maybe_import("pymongo.synchronous.network"),
+            _maybe_import("pymongo.network_layer"),
+        )
+        if module is not None
+    ]
+    socket_checker = _maybe_import("pymongo.socket_checker")
 
-    # --- 1. Socket creation + connect + SSL ---
-    _orig_configured_socket = _pool._configured_socket
+    if not pool_modules and not network_modules:
+        return
 
-    def _green_configured_socket(*args: object, **kwargs: object) -> object:
-        return _run_in_thread(_orig_configured_socket, *args, **kwargs)
+    configured_wrapped: dict[int, object] = {}
+    for module in pool_modules:
+        _patch_attr(module, "_configured_socket", configured_wrapped)
+        _patch_attr(module, "_configured_socket_interface", configured_wrapped)
 
-    _pool._configured_socket = _green_configured_socket  # type: ignore[assignment]
+    command_wrapped: dict[int, object] = {}
+    for module in (*network_modules, *pool_modules):
+        _patch_attr(module, "command", command_wrapped)
 
-    # --- 2. command (send + receive) ---
-    _orig_command = _network.command
+    receive_wrapped: dict[int, object] = {}
+    for module in (*network_modules, *pool_modules):
+        _patch_attr(module, "receive_message", receive_wrapped)
 
-    def _green_command(*args: object, **kwargs: object) -> object:
-        return _run_in_thread(_orig_command, *args, **kwargs)
-
-    _network.command = _green_command  # type: ignore[assignment]
-    if hasattr(_pool, "command"):
-        # pool.py imports network.command into module globals. Connection.command()
-        # resolves that global at runtime, so patch the alias too.
-        _pool.command = _green_command  # type: ignore[assignment]
-
-    # --- 3. receive_message (cursor reads) ---
-    _orig_receive_message = _network.receive_message
-
-    def _green_receive_message(*args: object, **kwargs: object) -> object:
-        return _run_in_thread(_orig_receive_message, *args, **kwargs)
-
-    _network.receive_message = _green_receive_message  # type: ignore[assignment]
-
-    # --- 4. SocketChecker: use original select.poll ---
-    try:
-        import pymongo.socket_checker as _sc
-
-        _orig_poll_cls = _get_original("select", "poll")
-
-        class _OriginalSocketChecker(_sc.SocketChecker):
-            def __init__(self) -> None:
-                if _sc._HAVE_POLL and _orig_poll_cls is not None:
-                    self._poller = _orig_poll_cls()  # type: ignore[operator]
-                else:
-                    self._poller = None
-
-        _sc.SocketChecker = _OriginalSocketChecker  # type: ignore[misc]
-    except (ImportError, AttributeError):
-        pass
+    if socket_checker is not None:
+        _patch_socket_checker(socket_checker)
 
     _patched = True
