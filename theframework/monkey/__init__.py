@@ -23,6 +23,7 @@ __all__ = [
     "patch_select",
     "patch_selectors",
     "patch_ssl",
+    "patch_pymongo",
     "is_patched",
 ]
 
@@ -147,6 +148,19 @@ def patch_ssl() -> None:
     # Only set sslsocket_class — wrap_socket() uses this to create sockets.
     # isinstance(x, ssl.SSLSocket) still works because our class is a subclass.
     ssl.SSLContext.sslsocket_class = SSLSocket
+
+
+def patch_pymongo() -> None:
+    """Make pymongo use thread-based cooperative I/O.
+
+    Call this AFTER ``patch_all()`` and AFTER importing pymongo.
+    Replaces pymongo's socket creation and low-level network I/O so
+    blocking MongoDB operations run in a background thread pool while
+    the calling greenlet yields cooperatively.
+    """
+    from theframework.monkey._pymongo import patch_pymongo as _do_patch
+
+    _do_patch()
 
 
 # ---------------------------------------------------------------------------
