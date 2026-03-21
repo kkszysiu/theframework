@@ -229,6 +229,18 @@ def patch_pymongo() -> None:
     for module in (*network_modules, *pool_modules):
         _patch_attr(module, "receive_message", receive_wrapped)
 
+    # --- Connection.send_message (query/insert sends) ---
+    # server.run_operation() calls conn.send_message() then conn.receive_message()
+    # as separate calls.  Without wrapping send_message, self.conn.sendall() runs
+    # in the greenlet context which registers the socket with io_uring (sets it
+    # non-blocking).  The subsequent receive_message (wrapped) then fails in its
+    # worker thread because recv_into hits BlockingIOError on the non-blocking fd.
+    send_wrapped: dict[int, object] = {}
+    for module in pool_modules:
+        conn_cls = getattr(module, "Connection", None)
+        if conn_cls is not None:
+            _patch_attr(conn_cls, "send_message", send_wrapped)
+
     if socket_checker is not None:
         _patch_socket_checker(socket_checker)
 
