@@ -25,6 +25,7 @@ from importlib import import_module as _import_module
 
 import _framework_core
 
+from theframework.monkey._state import get_original as _get_original
 from theframework.monkey._state import hub_is_running as _hub_is_running
 
 # Poll event constant
@@ -142,6 +143,58 @@ def _patch_attr(module: object, attr: str, wrapped: dict[int, object]) -> None:
     setattr(module, attr, _wrap_via_thread(wrapped, original))
 
 
+def _patch_socket_checker(module: object) -> None:
+    if not hasattr(module, "SocketChecker"):
+        return
+
+    original_select = _get_original("select", "select")
+    original_poll = _get_original("select", "poll")
+    if original_select is None:
+        return
+
+    socket_checker_cls = module.SocketChecker
+    orig_init = socket_checker_cls.__init__
+
+    def _patched_init(self: object, *args: object, **kwargs: object) -> None:
+        orig_init(self, *args, **kwargs)
+        self._poller = None
+
+    def _patched_select(
+        self: object,
+        sock: object,
+        read: bool = False,
+        write: bool = False,
+        timeout: float | None = 0,
+    ) -> bool:
+        while True:
+            try:
+                if original_poll is not None:
+                    poller = original_poll()  # type: ignore[operator]
+                    mask = module.select.POLLERR | module.select.POLLHUP
+                    if read:
+                        mask |= module.select.POLLIN | module.select.POLLPRI
+                    if write:
+                        mask |= module.select.POLLOUT
+                    poller.register(sock, mask)
+                    try:
+                        timeout_ms = None if timeout is None else timeout * 1000
+                        return bool(poller.poll(timeout_ms))
+                    finally:
+                        poller.unregister(sock)
+
+                rlist = [sock] if read else []
+                wlist = [sock] if write else []
+                return any(original_select(rlist, wlist, [sock], timeout))  # type: ignore[misc]
+            except (module._SelectError, OSError) as exc:  # type: ignore[attr-defined]
+                if module._errno_from_exception(exc) in (module.errno.EINTR, module.errno.EAGAIN):
+                    continue
+                raise
+
+    module._HAVE_POLL = False
+    socket_checker_cls.__init__ = _patched_init
+    socket_checker_cls.select = _patched_select
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -176,6 +229,7 @@ def patch_pymongo() -> None:
         )
         if module is not None
     ]
+    socket_checker = _maybe_import("pymongo.socket_checker")
     if not pool_modules and not network_modules:
         return
 
@@ -203,5 +257,8 @@ def patch_pymongo() -> None:
         conn_cls = getattr(module, "Connection", None)
         if conn_cls is not None:
             _patch_attr(conn_cls, "send_message", send_wrapped)
+
+    if socket_checker is not None:
+        _patch_socket_checker(socket_checker)
 
     _patched = True

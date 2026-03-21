@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import threading
 
 import pytest
@@ -38,7 +39,7 @@ def test_run_in_thread_does_not_nest_inside_mongo_worker() -> None:
     assert inner_name == outer_name
 
 
-def test_patch_pymongo_updates_current_aliases_without_touching_socket_checker() -> None:
+def test_patch_pymongo_updates_current_aliases_and_socket_checker() -> None:
     pymongo = pytest.importorskip("pymongo")
 
     patch_all()
@@ -54,7 +55,17 @@ def test_patch_pymongo_updates_current_aliases_without_touching_socket_checker()
 
     assert sync_pool.command is not orig_pool_command
     assert sync_pool.receive_message is not orig_pool_receive
-    assert socket_checker.SocketChecker.select is orig_select
+    assert socket_checker.SocketChecker.select is not orig_select
+
+    checker = socket_checker.SocketChecker()
+    assert checker._poller is None
+
+    left, right = socket.socketpair()
+    try:
+        assert checker.select(left, write=True, timeout=0.0) is True
+    finally:
+        left.close()
+        right.close()
 
     import pymongo.pool as pool
 
