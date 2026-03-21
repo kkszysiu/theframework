@@ -6,6 +6,8 @@ sends real TCP traffic, and asserts real responses.  No mocks.
 
 from __future__ import annotations
 
+import _socket
+import gc
 import http.client
 import select as select_mod
 import selectors
@@ -238,6 +240,96 @@ class TestCooperativeSocket:
         assert len(results) == 5
         for i, resp in enumerate(sorted(results)):
             assert b"200 OK" in resp
+
+
+def test_gc_finalizer_unregisters_registered_fd() -> None:
+    """GC of a cooperative socket must clear hub registration before fd reuse."""
+    patch_all()
+
+    target_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    target_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    target_sock.bind(("127.0.0.1", 0))
+    target_sock.listen(8)
+    target_port = target_sock.getsockname()[1]
+    errors: list[Exception] = []
+
+    def echo_target() -> None:
+        try:
+            while True:
+                conn, _ = target_sock.accept()
+                data = conn.recv(4096)
+                if data:
+                    conn.sendall(data)
+                conn.close()
+        except OSError:
+            pass
+
+    def gc_reuse_handler(fd: int) -> None:
+        replacement: socket.socket | None = None
+        spare_sockets: list[socket.socket] = []
+        try:
+            first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            first.settimeout(5.0)
+            first.connect(("127.0.0.1", target_port))
+            leaked_fd = first.fileno()
+            first.sendall(b"ping")
+            assert first.recv(4) == b"ping"
+
+            del first
+            gc.collect()
+
+            for _ in range(512):
+                candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                if candidate.fileno() == leaked_fd:
+                    replacement = candidate
+                    break
+                spare_sockets.append(candidate)
+
+            if replacement is None:
+                raise AssertionError(f"failed to reuse fd {leaked_fd}")
+
+            for extra in spare_sockets:
+                extra.close()
+            spare_sockets.clear()
+
+            replacement.settimeout(5.0)
+            replacement.connect(("127.0.0.1", target_port))
+            replacement.sendall(b"pong")
+            assert replacement.recv(4) == b"pong"
+            replacement.close()
+            replacement = None
+
+            _framework_core.green_send(fd, b"ok")
+        except Exception as exc:
+            errors.append(exc)
+            try:
+                _framework_core.green_send(fd, b"err")
+            except OSError:
+                pass
+        finally:
+            if replacement is not None:
+                replacement.close()
+            for extra in spare_sockets:
+                extra.close()
+
+    echo_thread = threading.Thread(target=echo_target, daemon=True)
+    echo_thread.start()
+
+    ready = threading.Event()
+    thread, listen_sock = _start_hub(gc_reuse_handler, ready)
+
+    try:
+        client = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.connect(("127.0.0.1", _HUB_PORT))
+        assert client.recv(16) == b"ok"
+        client.close()
+        assert not errors, f"handler errors: {errors!r}"
+    finally:
+        _framework_core.hub_stop()
+        thread.join(timeout=5)
+        listen_sock.close()
+        target_sock.close()
 
 
 # ===================================================================
