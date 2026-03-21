@@ -246,8 +246,11 @@ def test_gc_finalizer_unregisters_registered_fd() -> None:
     """GC of a cooperative socket must clear hub registration before fd reuse."""
     patch_all()
 
-    target_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    target_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    # Use the patched socket API here. This helper thread is not running the
+    # hub, so the operations fall back to normal blocking I/O, but we still get
+    # the full socket interface (including accept()).
+    target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     target_sock.bind(("127.0.0.1", 0))
     target_sock.listen(8)
     target_port = target_sock.getsockname()[1]
