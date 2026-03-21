@@ -87,6 +87,11 @@ class socket(_socket.socket):
                     _framework_core.green_unregister_fd(self.fileno())
                 except RuntimeError:
                     pass
+            else:
+                try:
+                    _framework_core.green_forget_fd(self.fileno())
+                except RuntimeError:
+                    pass
             self._registered = False
 
     # -- timeout bookkeeping -------------------------------------------------
@@ -383,6 +388,11 @@ class socket(_socket.socket):
                         _framework_core.green_unregister_fd(self.fileno())
                     except RuntimeError:
                         pass
+                else:
+                    try:
+                        _framework_core.green_forget_fd(self.fileno())
+                    except RuntimeError:
+                        pass
                 self._registered = False
             super().close()
         except Exception:
@@ -406,9 +416,13 @@ class socket(_socket.socket):
                         super().close()
                 else:
                     # Not on the hub thread (e.g. pymongo background monitor).
-                    # The hub is not thread-safe — do a plain close.
-                    # The stale fd_to_conn entry is handled by
-                    # _ensure_registered which catches "fd already registered".
+                    # The hub is not thread-safe — do a plain close, but first
+                    # clear the fd->connection mapping so an fd reuse in the
+                    # hub thread cannot alias the old Connection entry.
+                    try:
+                        _framework_core.green_forget_fd(self.fileno())
+                    except RuntimeError:
+                        pass
                     super().close()
             else:
                 super().close()

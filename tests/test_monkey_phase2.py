@@ -42,6 +42,7 @@ _HUB_PORT: int = 0
 def _start_hub(
     handler_fn: object,
     ready: threading.Event,
+    config: dict[str, object] | None = None,
 ) -> tuple[threading.Thread, socket.socket]:
     import _socket
 
@@ -88,7 +89,10 @@ def _start_hub(
                 mark_hub_running(hub_g)
                 _run_acceptor()
 
-            _framework_core.hub_run(raw_sock.fileno(), _acceptor_with_mark)
+            if config is None:
+                _framework_core.hub_run(raw_sock.fileno(), _acceptor_with_mark)
+            else:
+                _framework_core.hub_run(raw_sock.fileno(), _acceptor_with_mark, config)
         finally:
             mark_hub_stopped()
 
@@ -518,6 +522,89 @@ class TestSocketCloseUsesGreenClose:
             listen_sock.close()
 
         assert len(close_result) == 1
+
+    def test_close_registered_off_thread_releases_idle_slot(self) -> None:
+        """Closing a registered socket off the hub thread must free its slot."""
+        patch_all()
+
+        import _socket
+
+        target_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        target_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        target_sock.bind(("127.0.0.1", 0))
+        target_sock.listen(8)
+        target_port = target_sock.getsockname()[1]
+
+        errors: list[Exception] = []
+        handoff: list[CoopSocket | None] = [None]
+        handoff_ready = threading.Event()
+
+        def _echo_target() -> None:
+            try:
+                while True:
+                    conn, _ = target_sock.accept()
+                    data = conn.recv(4096)
+                    if data:
+                        conn.sendall(data)
+                    conn.close()
+            except OSError:
+                pass
+
+        def _handler(fd: int) -> None:
+            try:
+                first = CoopSocket(socket.AF_INET, socket.SOCK_STREAM)
+                first.settimeout(5.0)
+                first.connect(("127.0.0.1", target_port))
+                first.sendall(b"ping")
+                assert first.recv(4) == b"ping"
+
+                handoff[0] = first
+                handoff_ready.set()
+
+                _framework_core.green_sleep(0.1)
+
+                second = CoopSocket(socket.AF_INET, socket.SOCK_STREAM)
+                second.settimeout(5.0)
+                second.connect(("127.0.0.1", target_port))
+                second.sendall(b"pong")
+                assert second.recv(4) == b"pong"
+                second.close()
+
+                _framework_core.green_send(fd, b"ok")
+            except Exception as exc:
+                errors.append(exc)
+                try:
+                    _framework_core.green_send(fd, b"err")
+                except OSError:
+                    pass
+
+        echo_thread = threading.Thread(target=_echo_target, daemon=True)
+        echo_thread.start()
+
+        ready = threading.Event()
+        thread, listen_sock = _start_hub(_handler, ready, {"max_connections": 2})
+        client: _socket.socket | None = None
+
+        try:
+            client = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(("127.0.0.1", _HUB_PORT))
+
+            assert handoff_ready.wait(timeout=5), "handler never registered first socket"
+            assert handoff[0] is not None
+
+            handoff[0].close()
+            handoff[0] = None
+
+            assert client.recv(16) == b"ok"
+            assert not errors, f"handler errors: {errors!r}"
+        finally:
+            if client is not None:
+                client.close()
+            _framework_core.hub_stop()
+            thread.join(timeout=5)
+            listen_sock.close()
+            target_sock.close()
 
 
 # ===================================================================

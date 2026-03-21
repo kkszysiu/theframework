@@ -2095,6 +2095,57 @@ pub fn pyGreenUnregisterFd(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObj
     return hub_ptr.greenUnregisterFd(@intCast(fd_long));
 }
 
+/// green_forget_fd(fd) → None
+///
+/// Best-effort bookkeeping cleanup for a registered fd that was closed from a
+/// non-hub thread. This does NOT touch the io_uring ring. It only clears the
+/// fd→connection mapping immediately so a reused fd number cannot alias an old
+/// connection entry. If the connection is currently idle and unowned, it also
+/// releases the pool slot right away.
+///
+/// This function is intentionally forgiving:
+/// - If no hub is running, it is a no-op.
+/// - If the fd is not tracked, it is a no-op.
+pub fn pyGreenForgetFd(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    var fd_long: c_long = 0;
+    if (py.PyArg_ParseTuple(args, "l", &fd_long) == 0)
+        return null;
+
+    const none = py.py_helper_none();
+
+    const hub_ptr = getHub() orelse {
+        py.py_helper_incref(none);
+        return none;
+    };
+
+    const fd: posix.fd_t = @intCast(fd_long);
+    const fd_usize: usize = @intCast(fd);
+    if (fd_usize >= MAX_FDS) {
+        py.py_helper_incref(none);
+        return none;
+    }
+
+    const pool_idx = hub_ptr.fd_to_conn[fd_usize] orelse {
+        py.py_helper_incref(none);
+        return none;
+    };
+
+    hub_ptr.fd_to_conn[fd_usize] = null;
+
+    const conn = &hub_ptr.pool.connections[pool_idx];
+
+    // Only recycle the slot when it is truly idle. If an operation is still
+    // in-flight, leave the Connection object alive so any stale CQE can still
+    // land on the original generation and wake the blocked greenlet with an
+    // error. Clearing fd_to_conn above is enough to prevent fd-number aliasing.
+    if (conn.fd == fd and conn.pending_ops == 0 and conn.greenlet == null) {
+        hub_ptr.pool.release(conn);
+    }
+
+    py.py_helper_incref(none);
+    return none;
+}
+
 /// green_poll_multi(fds_list, events_list, timeout_ms) → list[tuple[int, int]]
 pub fn pyGreenPollMulti(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     var fds_list: ?*PyObject = null;
