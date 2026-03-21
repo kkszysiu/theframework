@@ -362,6 +362,24 @@ class socket(_socket.socket):
         if not self._closed:
             self.close()
 
+    def __del__(self) -> None:
+        # CPython's _socket.socket finalizer does not call our close()
+        # override. If a registered socket dies via GC, clear the hub entry
+        # before the base type closes and frees the fd for reuse.
+        if getattr(self, "_closed", True):
+            return
+        try:
+            self._closed = True
+            if getattr(self, "_registered", False):
+                try:
+                    _framework_core.green_unregister_fd(self.fileno())
+                except RuntimeError:
+                    pass
+                self._registered = False
+            super().close()
+        except Exception:
+            pass
+
     # -- close / detach ------------------------------------------------------
 
     def close(self) -> None:
