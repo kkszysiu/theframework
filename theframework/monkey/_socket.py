@@ -81,10 +81,11 @@ class socket(_socket.socket):
 
     def _unregister(self) -> None:
         if self._registered:
-            try:
-                _framework_core.green_unregister_fd(self.fileno())
-            except RuntimeError:
-                pass
+            if _hub_is_running():
+                try:
+                    _framework_core.green_unregister_fd(self.fileno())
+                except RuntimeError:
+                    pass
             self._registered = False
 
     # -- timeout bookkeeping -------------------------------------------------
@@ -373,10 +374,14 @@ class socket(_socket.socket):
         try:
             self._closed = True
             if getattr(self, "_registered", False):
-                try:
-                    _framework_core.green_unregister_fd(self.fileno())
-                except RuntimeError:
-                    pass
+                # Only touch the hub from the hub thread — background
+                # threads (e.g. pymongo monitors) must not call into
+                # the io_uring hub which is not thread-safe.
+                if _hub_is_running():
+                    try:
+                        _framework_core.green_unregister_fd(self.fileno())
+                    except RuntimeError:
+                        pass
                 self._registered = False
             super().close()
         except Exception:
@@ -389,14 +394,20 @@ class socket(_socket.socket):
         if self._io_refs < 1:
             if self._registered:
                 self._registered = False
-                try:
-                    # green_close cancels any pending io_uring operations
-                    # on this fd (waking blocked greenlets with errors)
-                    # and then closes the fd.
-                    _framework_core.green_close(self.fileno())
-                except RuntimeError, OSError:
-                    # If green_close fails (e.g., hub not running),
-                    # fall back to regular close.
+                if _hub_is_running():
+                    try:
+                        # green_close cancels any pending io_uring operations
+                        # on this fd (waking blocked greenlets with errors)
+                        # and then closes the fd.
+                        _framework_core.green_close(self.fileno())
+                    except (RuntimeError, OSError):
+                        # If green_close fails, fall back to regular close.
+                        super().close()
+                else:
+                    # Not on the hub thread (e.g. pymongo background monitor).
+                    # The hub is not thread-safe — do a plain close.
+                    # The stale fd_to_conn entry is handled by
+                    # _ensure_registered which catches "fd already registered".
                     super().close()
             else:
                 super().close()
