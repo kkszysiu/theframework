@@ -12,14 +12,17 @@ threads (where ``hub_is_running()`` is False), so they stay in plain
 blocking mode and never touch io_uring.  The calling greenlet yields to
 the hub and resumes when the thread finishes.
 
-The three patching points:
+The effective patching points:
 
 1. ``pymongo.pool._configured_socket`` — socket creation + connect + SSL.
    Running this in a thread ensures the socket is never registered with
    the hub and stays blocking.
 
-2. ``pymongo.network.command`` — sends a command and reads the response.
-   This is the main I/O entry point for all MongoDB operations.
+2. ``pymongo.network.command`` AND ``pymongo.pool.command`` — sends a
+   command and reads the response. ``pymongo.pool`` imports
+   ``pymongo.network.command`` into its own module globals, so patching
+   ``pymongo.network.command`` alone is not enough after pymongo has
+   already been imported.
 
 3. ``pymongo.network.receive_message`` — reads a response (used for
    cursor iteration via ``getMore``).
@@ -148,6 +151,10 @@ def patch_pymongo() -> None:
         return _run_in_thread(_orig_command, *args, **kwargs)
 
     _network.command = _green_command  # type: ignore[assignment]
+    if hasattr(_pool, "command"):
+        # pool.py imports network.command into module globals. Connection.command()
+        # resolves that global at runtime, so patch the alias too.
+        _pool.command = _green_command  # type: ignore[assignment]
 
     # --- 3. receive_message (cursor reads) ---
     _orig_receive_message = _network.receive_message
