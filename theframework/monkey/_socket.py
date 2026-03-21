@@ -74,8 +74,12 @@ class socket(_socket.socket):
             try:
                 _framework_core.green_register_fd(self.fileno())
                 self._registered = True
-            except RuntimeError:
-                pass
+            except RuntimeError as e:
+                import logging
+                logging.getLogger("theframework.socket").error(
+                    "green_register_fd failed for fd=%s: %s", self.fileno(), e
+                )
+                raise
 
     def _unregister(self) -> None:
         if self._registered:
