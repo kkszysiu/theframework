@@ -73,13 +73,11 @@ class socket(_socket.socket):
             super().setblocking(False)
             try:
                 _framework_core.green_register_fd(self.fileno())
-                self._registered = True
-            except RuntimeError as e:
-                import logging
-                logging.getLogger("theframework.socket").error(
-                    "green_register_fd failed for fd=%s: %s", self.fileno(), e
-                )
-                raise
+            except RuntimeError:
+                # fd already registered — recycled fd number from a socket
+                # that was closed without proper unregistration (e.g. GC'd).
+                pass
+            self._registered = True
 
     def _unregister(self) -> None:
         if self._registered:
@@ -92,6 +90,10 @@ class socket(_socket.socket):
     # -- timeout bookkeeping -------------------------------------------------
 
     def settimeout(self, timeout: float | None) -> None:
+        # Guard against sentinel objects (e.g. smtplib._GLOBAL_DEFAULT_TIMEOUT)
+        # being passed as timeout values — treat them as None (no timeout).
+        if not isinstance(timeout, (int, float, type(None))):
+            timeout = None
         self._timeout_value = timeout
         if self._registered:
             # Already doing cooperative I/O — keep non-blocking
@@ -416,6 +418,7 @@ class socket(_socket.socket):
 
 
 _GLOBAL_DEFAULT_TIMEOUT = object()
+_STDLIB_DEFAULT_TIMEOUT = _orig_socket_mod._GLOBAL_DEFAULT_TIMEOUT
 
 
 def create_connection(
@@ -431,7 +434,7 @@ def create_connection(
         sock: socket | None = None
         try:
             sock = socket(af, socktype, proto)
-            if timeout is not _GLOBAL_DEFAULT_TIMEOUT:
+            if timeout is not _GLOBAL_DEFAULT_TIMEOUT and timeout is not _STDLIB_DEFAULT_TIMEOUT:
                 sock.settimeout(timeout)  # type: ignore[arg-type]
             if source_address:
                 sock.bind(source_address)
