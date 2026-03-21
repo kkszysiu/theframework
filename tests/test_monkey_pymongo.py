@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import socket
 import threading
 
 import pytest
 
 from theframework.monkey import patch_all, patch_pymongo
 from theframework.monkey._pymongo import _run_in_thread
-from theframework.monkey._state import get_original
 
 
 def test_run_in_thread_uses_mongo_worker_from_plain_thread() -> None:
@@ -40,15 +38,12 @@ def test_run_in_thread_does_not_nest_inside_mongo_worker() -> None:
     assert inner_name == outer_name
 
 
-def test_patch_pymongo_updates_current_aliases_and_socket_checker() -> None:
+def test_patch_pymongo_updates_current_aliases_without_touching_socket_checker() -> None:
     pymongo = pytest.importorskip("pymongo")
 
     patch_all()
 
     import pymongo.socket_checker as socket_checker
-
-    checker = socket_checker.SocketChecker()
-    assert checker._poller.__class__.__module__ == "theframework.monkey._select"
 
     sync_pool = pytest.importorskip("pymongo.synchronous.pool")
     orig_pool_command = sync_pool.command
@@ -59,18 +54,7 @@ def test_patch_pymongo_updates_current_aliases_and_socket_checker() -> None:
 
     assert sync_pool.command is not orig_pool_command
     assert sync_pool.receive_message is not orig_pool_receive
-    assert socket_checker.SocketChecker.select is not orig_select
-
-    left, right = socket.socketpair()
-    try:
-        assert checker.select(left, write=True, timeout=0.0) is True
-    finally:
-        left.close()
-        right.close()
-
-    orig_poll_cls = get_original("select", "poll")
-    assert orig_poll_cls is not None
-    assert isinstance(checker._poller, orig_poll_cls)
+    assert socket_checker.SocketChecker.select is orig_select
 
     import pymongo.pool as pool
 

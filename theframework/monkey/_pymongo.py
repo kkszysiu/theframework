@@ -5,11 +5,11 @@ socket polling helpers, and several imported function aliases. Those paths can
 interact badly with our cooperative stdlib monkey patches when they execute in
 arbitrary threads.
 
-Strategy: hub threads funnel MongoDB I/O through a dedicated worker pool and
-wait cooperatively via pipe + green_poll_fd.  Plain background threads (e.g.
-pymongo monitors) call the original functions directly — ``hub_is_running()``
-is false on those threads so sockets stay in blocking mode and never touch
-io_uring.
+Strategy: funnel all sync PyMongo network I/O through a dedicated worker pool.
+Hub threads wait cooperatively via pipe + green_poll_fd. Plain background
+threads block on ``Future.result()``. Once execution is inside a mongo worker,
+nested PyMongo calls run inline so sockets stay on one normal blocking thread
+and never bounce through the hub's monkey-patched polling stack.
 
 The patch supports both the older module layout (``pymongo.pool`` /
 ``pymongo.network``) and the current one (``pymongo.synchronous.pool`` /
@@ -25,10 +25,7 @@ from importlib import import_module as _import_module
 
 import _framework_core
 
-from theframework.monkey._state import (
-    get_original as _get_original,
-    hub_is_running as _hub_is_running,
-)
+from theframework.monkey._state import hub_is_running as _hub_is_running
 
 # Poll event constant
 _POLLIN: int = 0x001
@@ -44,7 +41,15 @@ _worker_local = _threading.local()
 def _get_pool() -> ThreadPoolExecutor:
     global _mongo_pool
     if _mongo_pool is None:
-        _mongo_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="mongo-io")
+        raw_size = _os.getenv("THEFRAMEWORK_MONGO_IO_WORKERS")
+        if raw_size is not None:
+            try:
+                max_workers = max(1, int(raw_size))
+            except ValueError:
+                max_workers = 32
+        else:
+            max_workers = 32
+        _mongo_pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="mongo-io")
     return _mongo_pool
 
 
@@ -61,11 +66,10 @@ def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
     """Run *fn(*args, **kwargs)* in the mongo I/O thread pool.
 
     Hub threads wait cooperatively for the worker via pipe + green_poll_fd.
-    Non-hub threads (e.g. pymongo monitor threads) call *fn* directly — they
-    already run with hub_is_running() == False so sockets stay in blocking
-    mode.  Calls from inside a mongo worker also run inline.
+    Non-hub threads block on ``Future.result()``. Calls from inside a mongo
+    worker run inline so nested PyMongo helpers stay on the same OS thread.
     """
-    if _in_mongo_worker() or not _hub_is_running():
+    if _in_mongo_worker():
         return fn(*args, **kwargs)  # type: ignore[operator]
 
     pool = _get_pool()
@@ -76,6 +80,9 @@ def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
             return fn(*args, **kwargs)  # type: ignore[operator]
         finally:
             _worker_local.active = False
+
+    if not _hub_is_running():
+        return pool.submit(_call).result()
 
     r_fd, w_fd = _os.pipe()
     _os.set_blocking(r_fd, False)
@@ -135,45 +142,6 @@ def _patch_attr(module: object, attr: str, wrapped: dict[int, object]) -> None:
     setattr(module, attr, _wrap_via_thread(wrapped, original))
 
 
-def _patch_socket_checker(module: object) -> None:
-    if not hasattr(module, "SocketChecker"):
-        return
-
-    socket_checker_cls = module.SocketChecker
-    orig_poll_cls = _get_original("select", "poll")
-    if orig_poll_cls is None:
-        return
-    try:
-        orig_poller_type = type(orig_poll_cls())  # type: ignore[operator]
-    except TypeError:
-        orig_poller_type = None
-
-    def _ensure_original_poller(self: object) -> None:
-        if not getattr(module, "_HAVE_POLL", False):
-            return
-        poller = getattr(self, "_poller", None)
-        if poller is None:
-            self._poller = orig_poll_cls()  # type: ignore[operator]
-            return
-        if orig_poller_type is not None and not isinstance(poller, orig_poller_type):
-            self._poller = orig_poll_cls()  # type: ignore[operator]
-
-    orig_init = socket_checker_cls.__init__
-
-    def _patched_init(self: object, *args: object, **kwargs: object) -> None:
-        orig_init(self, *args, **kwargs)
-        _ensure_original_poller(self)
-
-    orig_select = socket_checker_cls.select
-
-    def _patched_select(self: object, *args: object, **kwargs: object) -> object:
-        _ensure_original_poller(self)
-        return orig_select(self, *args, **kwargs)
-
-    socket_checker_cls.__init__ = _patched_init
-    socket_checker_cls.select = _patched_select
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -208,8 +176,6 @@ def patch_pymongo() -> None:
         )
         if module is not None
     ]
-    socket_checker = _maybe_import("pymongo.socket_checker")
-
     if not pool_modules and not network_modules:
         return
 
@@ -237,8 +203,5 @@ def patch_pymongo() -> None:
         conn_cls = getattr(module, "Connection", None)
         if conn_cls is not None:
             _patch_attr(conn_cls, "send_message", send_wrapped)
-
-    if socket_checker is not None:
-        _patch_socket_checker(socket_checker)
 
     _patched = True
