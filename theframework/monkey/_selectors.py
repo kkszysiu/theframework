@@ -94,10 +94,9 @@ class CooperativeSelector(_orig_selectors_mod.BaseSelector):
         # When no hub is running, fall back to original select
         if not _hub_is_running():
             rlist, wlist = self._build_fd_lists()
-            t = timeout if timeout is not None else None
             try:
-                r, w, _ = _get_original_select(rlist, wlist, [], t if t is not None else -1)
-            except ValueError, OSError:
+                r, w, _ = _get_original_select(rlist, wlist, [], timeout)
+            except (ValueError, OSError):
                 return []
             return self._build_results(r, w)
 

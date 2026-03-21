@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import resource
 import select
 import signal
 import socket
@@ -28,6 +29,7 @@ HandlerFunc = Callable[[Request, Response], None]
 CRASH_WINDOW: float = 60.0
 MAX_CRASHES_IN_WINDOW: int = 5
 SHUTDOWN_TIMEOUT: float = 3.0  # Short timeout for quick shutdown
+_DEFAULT_GREENLET_STACK_SIZE: int = 0  # 0 = no override
 
 # ---------------------------------------------------------------------------
 # Module-level state (for signal handler communication)
@@ -39,6 +41,41 @@ _shutting_down: bool = False
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
+
+def _apply_greenlet_stack_config(config: dict[str, int] | None) -> None:
+    """Apply greenlet_stack_size from config.
+
+    Greenlets share the OS thread's C stack. Deep call chains (e.g. Django
+    middleware + ORM + template rendering) can exhaust the default 8 MiB stack.
+    This function increases the stack limit for the current process and sets
+    the default stack size for new threads.
+    """
+    if config is None:
+        return
+    stack_size = config.get("greenlet_stack_size", _DEFAULT_GREENLET_STACK_SIZE)
+    if not stack_size or stack_size <= 0:
+        return
+
+    # 1. Increase the soft RLIMIT_STACK so new threads get a larger stack.
+    #    On Linux this also allows the main thread's stack to grow up to the
+    #    new soft limit (the kernel extends the main thread's guard page).
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        if soft != resource.RLIM_INFINITY and stack_size > soft:
+            new_soft = stack_size
+            if hard != resource.RLIM_INFINITY:
+                new_soft = min(stack_size, hard)
+            resource.setrlimit(resource.RLIMIT_STACK, (new_soft, hard))
+    except (ValueError, OSError):
+        pass
+
+    # 2. Set the default stack size for new Python threads (pymongo monitors,
+    #    DNS resolver pool, etc.).
+    try:
+        threading.stack_size(stack_size)
+    except (ValueError, OSError):
+        pass
 
 
 def _log(msg: str, *, worker_id: int | None = None) -> None:
@@ -240,6 +277,8 @@ def _worker_main(
     config: dict[str, int] | None = None,
 ) -> None:
     """Entry point for a forked worker process."""
+    _apply_greenlet_stack_config(config)
+
     # 1. Reset signals - allow graceful shutdown via SIGTERM
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # For SIGTERM, use default handler which will terminate the process
@@ -290,6 +329,7 @@ def _serve_single(
     config: dict[str, int] | None = None,
 ) -> None:
     """Single-worker mode: no fork, current behavior."""
+    _apply_greenlet_stack_config(config)
     sock = _create_listen_socket(host, port, reuseport=False)
     listen_fd = sock.fileno()
 
@@ -576,7 +616,9 @@ def serve(
         config: Optional configuration dict passed to the Zig hub. Supported
                 keys: max_header_size, max_body_size, max_connections,
                 chunk_size, read_timeout_ms, keepalive_timeout_ms,
-                handler_timeout_ms.
+                handler_timeout_ms, greenlet_stack_size (bytes, e.g.
+                8388608 for 8 MiB — increases the OS stack limit so
+                greenlets can handle deep call chains).
     """
     if workers == 0:
         workers = os.cpu_count() or 1
