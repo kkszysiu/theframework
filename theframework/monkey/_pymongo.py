@@ -5,11 +5,11 @@ socket polling helpers, and several imported function aliases. Those paths can
 interact badly with our cooperative stdlib monkey patches when they execute in
 arbitrary threads.
 
-Strategy: funnel MongoDB socket creation and blocking network I/O through a
-dedicated worker pool. The hub thread waits cooperatively for completion; plain
-background threads simply block on the worker future. Either way, the actual
-Mongo I/O runs in ``mongo-io_*`` threads where ``hub_is_running()`` is false,
-so sockets stay in plain blocking mode and never touch io_uring.
+Strategy: hub threads funnel MongoDB I/O through a dedicated worker pool and
+wait cooperatively via pipe + green_poll_fd.  Plain background threads (e.g.
+pymongo monitors) call the original functions directly — ``hub_is_running()``
+is false on those threads so sockets stay in blocking mode and never touch
+io_uring.
 
 The patch supports both the older module layout (``pymongo.pool`` /
 ``pymongo.network``) and the current one (``pymongo.synchronous.pool`` /
@@ -60,11 +60,12 @@ def _in_mongo_worker() -> bool:
 def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
     """Run *fn(*args, **kwargs)* in the mongo I/O thread pool.
 
-    Hub threads wait cooperatively for the worker. Non-hub threads block on the
-    Future result. Calls originating from inside a mongo worker run inline to
-    avoid nested thread spawning.
+    Hub threads wait cooperatively for the worker via pipe + green_poll_fd.
+    Non-hub threads (e.g. pymongo monitor threads) call *fn* directly — they
+    already run with hub_is_running() == False so sockets stay in blocking
+    mode.  Calls from inside a mongo worker also run inline.
     """
-    if _in_mongo_worker():
+    if _in_mongo_worker() or not _hub_is_running():
         return fn(*args, **kwargs)  # type: ignore[operator]
 
     pool = _get_pool()
@@ -75,10 +76,6 @@ def _run_in_thread(fn: object, *args: object, **kwargs: object) -> object:
             return fn(*args, **kwargs)  # type: ignore[operator]
         finally:
             _worker_local.active = False
-
-    if not _hub_is_running():
-        future: Future[object] = pool.submit(_call)
-        return future.result()
 
     r_fd, w_fd = _os.pipe()
     _os.set_blocking(r_fd, False)
