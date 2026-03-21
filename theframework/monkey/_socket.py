@@ -73,10 +73,11 @@ class socket(_socket.socket):
             super().setblocking(False)
             try:
                 _framework_core.green_register_fd(self.fileno())
-            except RuntimeError:
+            except RuntimeError as exc:
                 # fd already registered — recycled fd number from a socket
                 # that was closed without proper unregistration (e.g. GC'd).
-                pass
+                if "fd already registered" not in str(exc):
+                    raise
             self._registered = True
 
     def _unregister(self) -> None:

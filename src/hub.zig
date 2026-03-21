@@ -1788,17 +1788,17 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     // The current greenlet IS the hub greenlet
     hub_ptr.hub_greenlet = py.py_helper_greenlet_getcurrent();
     if (hub_ptr.hub_greenlet == null) {
+        global_hub = null;
         hub_ptr.deinit();
         allocator.destroy(hub_ptr);
-        global_hub = null;
         return null;
     }
 
     // Create the acceptor greenlet with hub as parent
     const acceptor_g = py.py_helper_greenlet_new(acceptor_fn, hub_ptr.hub_greenlet) orelse {
+        global_hub = null;
         hub_ptr.deinit();
         allocator.destroy(hub_ptr);
-        global_hub = null;
         return null;
     };
 
@@ -1807,9 +1807,9 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     hub_ptr.ready.append(hub_ptr.allocator, acceptor_g) catch {
         py.py_helper_decref(acceptor_g);
         py.py_helper_decref(acceptor_g);
+        global_hub = null;
         hub_ptr.deinit();
         allocator.destroy(hub_ptr);
-        global_hub = null;
         _ = py.py_helper_err_no_memory();
         return null;
     };
@@ -1819,9 +1819,9 @@ pub fn pyHubRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     hub_ptr.hubLoop();
 
     // Cleanup
+    global_hub = null;
     hub_ptr.deinit();
     allocator.destroy(hub_ptr);
-    global_hub = null;
 
     if (py.py_helper_err_occurred() != null)
         return null;
@@ -2421,16 +2421,18 @@ fn tryParse(
     const resolved_path = path orelse return .invalid;
     const query_offset = std.mem.indexOfScalar(u8, resolved_path, '?') orelse resolved_path.len;
 
-    return .{ .complete = .{
-        .method = method,
-        .path = resolved_path,
-        .version = version,
-        .headers = headers[0..header_count], // arena-owned slice
-        .body = buf[header_bytes .. header_bytes + content_length],
-        .raw_bytes_consumed = header_bytes + content_length,
-        .keep_alive = ka,
-        .query_offset = query_offset,
-    } };
+    return .{
+        .complete = .{
+            .method = method,
+            .path = resolved_path,
+            .version = version,
+            .headers = headers[0..header_count], // arena-owned slice
+            .body = buf[header_bytes .. header_bytes + content_length],
+            .raw_bytes_consumed = header_bytes + content_length,
+            .keep_alive = ka,
+            .query_offset = query_offset,
+        },
+    };
 }
 
 /// Build a LazyRequest Python object from a parsed request.
