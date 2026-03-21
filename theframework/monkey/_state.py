@@ -8,8 +8,6 @@ from types import ModuleType
 
 import greenlet
 
-import _framework_core
-
 # Maps "module_name" -> {"attr_name": original_value}
 _saved: dict[str, dict[str, object]] = {}
 
@@ -87,28 +85,12 @@ def mark_hub_stopped() -> None:
 def hub_is_running() -> bool:
     """Return True if the io_uring hub is active in the current thread.
 
-    O(1) — reads a thread-local variable.  Falls back to the greenlet
-    parent-chain walk if the thread-local is not set (for backward
-    compatibility with code that calls ``_framework_core.hub_run``
-    directly without the Python wrapper).
+    This is intentionally a pure thread-local check. Background threads
+    that hit monkey-patched stdlib functions must never touch the process
+    global hub state just to decide whether they should take the
+    cooperative path.
     """
-    if _hub_local.hub_greenlet is not None:
-        return True
-
-    # Fallback: walk the parent chain.  This handles the case where
-    # hub_run was called directly without mark_hub_running().
-    try:
-        hub_g = _framework_core.get_hub_greenlet()
-    except RuntimeError:
-        return False
-    g: greenlet.greenlet | None = greenlet.getcurrent()
-    while g is not None:
-        if g is hub_g:
-            # Cache for future O(1) lookups in this thread.
-            _hub_local.hub_greenlet = hub_g
-            return True
-        g = g.parent
-    return False
+    return _hub_local.hub_greenlet is not None
 
 
 def get_fd(obj: object) -> int:

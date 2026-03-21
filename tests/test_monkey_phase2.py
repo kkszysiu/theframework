@@ -164,6 +164,31 @@ class TestHubIsRunningThreadLocal:
     def test_hub_local_has_hub_greenlet_attr(self) -> None:
         """The thread-local should have hub_greenlet attribute."""
         assert hasattr(_hub_local, "hub_greenlet")
+
+    def test_real_hub_in_other_thread_stays_false_here(self) -> None:
+        """A hub running in another thread must not make this thread cooperative."""
+        patch_all()
+        ready = threading.Event()
+        thread, listen_sock = _start_hub(_echo_handler, ready)
+
+        result: list[bool] = []
+        checked = threading.Event()
+
+        def _check_in_other_thread() -> None:
+            result.append(hub_is_running())
+            checked.set()
+
+        try:
+            t = threading.Thread(target=_check_in_other_thread)
+            t.start()
+            checked.wait(timeout=5)
+            t.join(timeout=5)
+        finally:
+            _framework_core.hub_stop()
+            thread.join(timeout=5)
+            listen_sock.close()
+
+        assert result == [False]
         assert _hub_local.hub_greenlet is None or isinstance(
             _hub_local.hub_greenlet, greenlet.greenlet
         )
@@ -445,6 +470,26 @@ class TestSocketCloseUsesGreenClose:
             _framework_core.hub_stop()
             thread.join(timeout=5)
             listen_sock.close()
+
+    def test_ensure_registered_only_swallows_already_registered(self) -> None:
+        """Unexpected registration failures should not be hidden."""
+        cs = CoopSocket(socket.AF_INET, socket.SOCK_STREAM)
+        mark_hub_running(greenlet.greenlet(lambda: None))
+        try:
+            original = _framework_core.green_register_fd
+
+            def _boom(fd: int) -> None:
+                _ = fd
+                raise RuntimeError("connection pool exhausted")
+
+            _framework_core.green_register_fd = _boom
+            with pytest.raises(RuntimeError, match="connection pool exhausted"):
+                cs._ensure_registered()
+            assert not cs._registered
+        finally:
+            _framework_core.green_register_fd = original
+            mark_hub_stopped()
+            cs.close()
 
     def test_close_registered_in_hub(self) -> None:
         """Integration: close a registered socket inside the hub uses green_close."""
